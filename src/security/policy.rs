@@ -92,6 +92,35 @@ pub struct SecurityPolicy {
     pub tracker: ActionTracker,
 }
 
+/// OS-level sandbox policy for plugin isolation.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SandboxPolicy {
+    pub read_only_filesystem: bool,
+    pub network_access: bool,
+    pub allow_sys_calls: Vec<String>,
+}
+
+impl SandboxPolicy {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn allow_network(mut self, allow: bool) -> Self {
+        self.network_access = allow;
+        self
+    }
+}
+
+impl Default for SandboxPolicy {
+    fn default() -> Self {
+        Self {
+            read_only_filesystem: true,
+            network_access: false,
+            allow_sys_calls: vec![],
+        }
+    }
+}
+
 impl Default for SecurityPolicy {
     fn default() -> Self {
         Self {
