@@ -15,7 +15,7 @@ SMOKE_CACHE_DIR="${SMOKE_CACHE_DIR:-.cache/buildx-smoke}"
 
 run_in_ci() {
   local cmd="$1"
-  "${compose_cmd[@]}" run --rm local-ci bash -c "$cmd"
+  "${compose_cmd[@]}" run -T --rm local-ci bash -c "$cmd"
 }
 
 build_smoke_image() {
