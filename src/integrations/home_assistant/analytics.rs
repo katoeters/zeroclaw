@@ -2,9 +2,11 @@ use super::HaState;
 
 pub struct HomeHabitAnalyzer;
 
+#[derive(Debug)]
 pub struct HabitSummary {
     pub active_lights: Vec<String>,
     pub message: String,
+    pub suggestions: Vec<String>,
 }
 
 impl HomeHabitAnalyzer {
@@ -19,6 +21,14 @@ impl HomeHabitAnalyzer {
             .map(|s| s.entity_id.clone())
             .collect();
 
+        let mut suggestions = Vec::new();
+        if !active_lights.is_empty() {
+            suggestions.push(format!(
+                "You have {} light(s) on. Would you like me to turn them off to save energy?",
+                active_lights.len()
+            ));
+        }
+
         let message = if active_lights.is_empty() {
             "All lights are off.".to_string()
         } else if active_lights.len() == 1 {
@@ -30,6 +40,7 @@ impl HomeHabitAnalyzer {
         HabitSummary {
             active_lights,
             message,
+            suggestions,
         }
     }
 }

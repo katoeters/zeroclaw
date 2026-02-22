@@ -27,4 +27,6 @@ fn test_analyze_lights() {
     assert_eq!(summary.active_lights.len(), 1);
     assert_eq!(summary.active_lights[0], "light.living_room");
     assert!(summary.message.contains("1 light is on"));
+    assert!(!summary.suggestions.is_empty());
+    assert!(summary.suggestions[0].contains("save energy"));
 }

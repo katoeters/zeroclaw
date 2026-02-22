@@ -63,3 +63,19 @@ impl HomeAssistantClient {
         Ok(resp.json().await?)
     }
 }
+
+pub async fn get_ha_insights(client: &HomeAssistantClient) -> anyhow::Result<String> {
+    let states = client.fetch_states().await?;
+    let analyzer = analytics::HomeHabitAnalyzer::new();
+    let summary = analyzer.analyze(&states);
+    
+    let mut output = summary.message;
+    if !summary.suggestions.is_empty() {
+        output.push_str("\n\nSuggestions:\n");
+        for suggestion in summary.suggestions {
+            output.push_str(&format!("- {suggestion}\n"));
+        }
+    }
+    
+    Ok(output)
+}
