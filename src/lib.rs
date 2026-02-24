@@ -64,6 +64,7 @@ pub mod rag;
 pub mod runtime;
 pub mod security;
 pub(crate) mod service;
+pub mod skillforge;
 pub(crate) mod skills;
 pub mod tools;
 pub(crate) mod tunnel;

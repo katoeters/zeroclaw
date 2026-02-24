@@ -1,8 +1,10 @@
 use crate::config::Config;
+use crate::observability::SystemNotifier;
 use anyhow::Result;
 use chrono::Utc;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
@@ -16,6 +18,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         .max(initial_backoff);
 
     crate::health::mark_component_ok("daemon");
+
+    let notifier = Arc::new(SystemNotifier::new(Arc::new(config.clone())));
 
     if config.heartbeat.enabled {
         let _ =
@@ -86,6 +90,38 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         crate::health::mark_component_ok("scheduler");
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
+
+    if config.skillforge.enabled {
+        let skillforge_cfg = config.clone();
+        let notifier_clone = Some(notifier.clone());
+        handles.push(spawn_component_supervisor(
+            "skillforge",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = skillforge_cfg.clone();
+                let n = notifier_clone.clone();
+                async move { run_skillforge_worker(cfg, n).await }
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("skillforge");
+        tracing::info!("SkillForge disabled; supervisor not started");
+    }
+
+    // Spawn config watcher to detect newly enabled tools
+    handles.push(spawn_config_watcher(config.clone(), notifier.clone()));
+
+    // Send startup notification with active tools summary
+    let tools = config.get_enabled_tools();
+    let mut tools_vec: Vec<_> = tools.into_iter().collect();
+    tools_vec.sort();
+    let tools_list = tools_vec.join(", ");
+    
+    let notifier_startup = notifier.clone();
+    tokio::spawn(async move {
+        let _ = notifier_startup.notify_telegram(&format!("🚀 *Ezra is online!* \nActive tools: `{}`", tools_list)).await;
+    });
 
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
@@ -206,6 +242,53 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             }
         }
     }
+}
+
+async fn run_skillforge_worker(config: Config, notifier: Option<Arc<SystemNotifier>>) -> Result<()> {
+    let forge = crate::skillforge::SkillForge::new(config.skillforge.clone(), notifier);
+    let interval_hours = config.skillforge.scan_interval_hours.max(1);
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_hours * 3600));
+
+    loop {
+        interval.tick().await;
+        match forge.forge().await {
+            Ok(_) => crate::health::mark_component_ok("skillforge"),
+            Err(e) => {
+                tracing::warn!("SkillForge pipeline failed: {e}");
+                crate::health::mark_component_error("skillforge", &e.to_string());
+            }
+        }
+    }
+}
+
+fn spawn_config_watcher(initial_config: Config, notifier: Arc<SystemNotifier>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut current_tools = initial_config.get_enabled_tools();
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+
+        loop {
+            interval.tick().await;
+
+            // Reload config from disk
+            match Config::load_or_init().await {
+                Ok(new_config) => {
+                    let new_tools = new_config.get_enabled_tools();
+                    
+                    // Find tools that were just enabled
+                    for tool in &new_tools {
+                        if !current_tools.contains(tool) {
+                            let _ = notifier.notify_new_tool(tool).await;
+                        }
+                    }
+                    
+                    current_tools = new_tools;
+                }
+                Err(e) => {
+                    tracing::warn!("Config watcher: Failed to reload config: {}", e);
+                }
+            }
+        }
+    })
 }
 
 fn has_supervised_channels(config: &Config) -> bool {

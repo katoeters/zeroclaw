@@ -371,11 +371,18 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
 }
 
 fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    allowed_domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
+    allowed_domains.iter().any(|pattern| {
+        if pattern == "*" {
+            return true;
+        }
+        if pattern.starts_with("*.") {
+            // Wildcard subdomain match
+            let suffix = &pattern[1..]; // ".example.com"
+            host.ends_with(suffix) || host == &pattern[2..]
+        } else {
+            // Exact match or subdomain
+            host == pattern || host.ends_with(&format!(".{pattern}"))
+        }
     })
 }
 
@@ -485,6 +492,13 @@ mod tests {
     fn validate_accepts_subdomain() {
         let tool = test_tool(vec!["example.com"]);
         assert!(tool.validate_url("https://api.example.com/v1").is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_wildcard() {
+        let tool = test_tool(vec!["*"]);
+        assert!(tool.validate_url("https://google.com").is_ok());
+        assert!(tool.validate_url("https://anything.org/path").is_ok());
     }
 
     #[test]
@@ -878,5 +892,29 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("IPv6"));
+    }
+
+    #[test]
+    fn host_matches_allowlist_wildcard() {
+        let allowed = vec!["*.example.com".into()];
+        assert!(host_matches_allowlist("sub.example.com", &allowed));
+        assert!(host_matches_allowlist("example.com", &allowed));
+        assert!(!host_matches_allowlist("other.com", &allowed));
+    }
+
+    #[test]
+    fn host_matches_allowlist_star() {
+        let allowed = vec!["*".into()];
+        assert!(host_matches_allowlist("anything.com", &allowed));
+        assert!(host_matches_allowlist("example.org", &allowed));
+    }
+
+    #[test]
+    fn validate_url_with_star_wildcard() {
+        let tool = test_tool(vec!["*"]);
+        assert!(tool.validate_url("https://google.com").is_ok());
+        assert!(tool.validate_url("https://anything.org/path").is_ok());
+        // Should still block private hosts
+        assert!(tool.validate_url("https://localhost").is_err());
     }
 }

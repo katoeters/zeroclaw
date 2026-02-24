@@ -10,79 +10,15 @@ pub mod scout;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 use self::evaluate::{EvalResult, Evaluator, Recommendation};
 use self::integrate::Integrator;
 use self::scout::{GitHubScout, Scout, ScoutResult, ScoutSource};
-
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct SkillForgeConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_auto_integrate")]
-    pub auto_integrate: bool,
-    #[serde(default = "default_sources")]
-    pub sources: Vec<String>,
-    #[serde(default = "default_scan_interval")]
-    pub scan_interval_hours: u64,
-    #[serde(default = "default_min_score")]
-    pub min_score: f64,
-    /// Optional GitHub personal-access token for higher rate limits.
-    #[serde(default)]
-    pub github_token: Option<String>,
-    /// Directory where integrated skills are written.
-    #[serde(default = "default_output_dir")]
-    pub output_dir: String,
-}
-
-fn default_auto_integrate() -> bool {
-    true
-}
-fn default_sources() -> Vec<String> {
-    vec!["github".into(), "clawhub".into()]
-}
-fn default_scan_interval() -> u64 {
-    24
-}
-fn default_min_score() -> f64 {
-    0.7
-}
-fn default_output_dir() -> String {
-    "./skills".into()
-}
-
-impl Default for SkillForgeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            auto_integrate: default_auto_integrate(),
-            sources: default_sources(),
-            scan_interval_hours: default_scan_interval(),
-            min_score: default_min_score(),
-            github_token: None,
-            output_dir: default_output_dir(),
-        }
-    }
-}
-
-impl std::fmt::Debug for SkillForgeConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SkillForgeConfig")
-            .field("enabled", &self.enabled)
-            .field("auto_integrate", &self.auto_integrate)
-            .field("sources", &self.sources)
-            .field("scan_interval_hours", &self.scan_interval_hours)
-            .field("min_score", &self.min_score)
-            .field("github_token", &self.github_token.as_ref().map(|_| "***"))
-            .field("output_dir", &self.output_dir)
-            .finish()
-    }
-}
+pub use crate::config::schema::SkillForgeConfig;
+use crate::observability::SystemNotifier;
+use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
 // ForgeReport — summary of a single pipeline run
@@ -106,16 +42,18 @@ pub struct SkillForge {
     config: SkillForgeConfig,
     evaluator: Evaluator,
     integrator: Integrator,
+    notifier: Option<Arc<SystemNotifier>>,
 }
 
 impl SkillForge {
-    pub fn new(config: SkillForgeConfig) -> Self {
+    pub fn new(config: SkillForgeConfig, notifier: Option<Arc<SystemNotifier>>) -> Self {
         let evaluator = Evaluator::new(config.min_score);
         let integrator = Integrator::new(config.output_dir.clone());
         Self {
             config,
             evaluator,
             integrator,
+            notifier,
         }
     }
 
@@ -137,7 +75,7 @@ impl SkillForge {
         let mut candidates: Vec<ScoutResult> = Vec::new();
 
         for src in &self.config.sources {
-            let source: ScoutSource = src.parse().unwrap(); // Infallible
+            let source = ScoutSource::from_str(src).unwrap(); // Infallible
             match source {
                 ScoutSource::GitHub => {
                     let scout = GitHubScout::new(self.config.github_token.clone());
@@ -184,6 +122,13 @@ impl SkillForge {
                         match self.integrator.integrate(&res.candidate) {
                             Ok(_) => {
                                 auto_integrated += 1;
+                                if let Some(notifier) = &self.notifier {
+                                    let skill_name = res.candidate.name.clone();
+                                    let notifier = notifier.clone();
+                                    tokio::spawn(async move {
+                                        let _ = notifier.notify_new_skill(&skill_name).await;
+                                    });
+                                }
                             }
                             Err(e) => {
                                 warn!(
@@ -237,7 +182,7 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        let forge = SkillForge::new(cfg);
+        let forge = SkillForge::new(cfg, None);
         let report = forge.forge().await.unwrap();
         assert_eq!(report.discovered, 0);
         assert_eq!(report.auto_integrated, 0);

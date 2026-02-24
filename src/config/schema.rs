@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
@@ -178,6 +178,10 @@ pub struct Config {
     /// Peripheral board configuration for hardware integration (`[peripherals]`).
     #[serde(default)]
     pub peripherals: PeripheralsConfig,
+
+    /// SkillForge auto-discovery and integration configuration (`[skillforge]`).
+    #[serde(default)]
+    pub skillforge: SkillForgeConfig,
 
     /// Delegate agent configurations for multi-agent workflows.
     #[serde(default)]
@@ -2846,6 +2850,7 @@ impl Default for Config {
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
+            skillforge: SkillForgeConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
@@ -3144,6 +3149,49 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
 }
 
 impl Config {
+    pub fn get_enabled_tools(&self) -> HashSet<String> {
+        let mut tools = HashSet::new();
+        // Core tools are always enabled
+        tools.insert("shell".to_string());
+        tools.insert("file_io".to_string());
+        tools.insert("memory".to_string());
+        tools.insert("screenshot".to_string());
+        tools.insert("image_info".to_string());
+        tools.insert("git_operations".to_string());
+        tools.insert("schedule".to_string());
+        tools.insert("pushover".to_string());
+        tools.insert("proxy_config".to_string());
+        tools.insert("ha_report".to_string());
+
+        if self.http_request.enabled {
+            tools.insert("http_request".to_string());
+        }
+        if self.browser.enabled {
+            tools.insert("browser".to_string());
+            tools.insert("browser_open".to_string());
+        }
+        if self.web_search.enabled {
+            tools.insert("web_search".to_string());
+        }
+        if self.composio.enabled {
+            tools.insert("composio".to_string());
+        }
+        if !self.agents.is_empty() {
+            tools.insert("delegate".to_string());
+        }
+        if self.hardware.enabled {
+            tools.insert("hardware".to_string());
+        }
+        if self.peripherals.enabled {
+            tools.insert("peripherals".to_string());
+        }
+        if self.cron.enabled {
+            tools.insert("cron".to_string());
+        }
+
+        tools
+    }
+
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
@@ -3739,6 +3787,64 @@ async fn sync_directory(path: &Path) -> Result<()> {
     {
         let _ = path;
         Ok(())
+    }
+}
+
+// ── SkillForge ───────────────────────────────────────────────────
+
+/// SkillForge auto-discovery and integration configuration (`[skillforge]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkillForgeConfig {
+    /// Enable SkillForge discovery and integration engine
+    #[serde(default)]
+    pub enabled: bool,
+    /// Automatically integrate discovered skills that meet min_score
+    #[serde(default = "default_auto_integrate")]
+    pub auto_integrate: bool,
+    /// List of sources to scout for skills (e.g. "github", "clawhub")
+    #[serde(default = "default_sources")]
+    pub sources: Vec<String>,
+    /// How often to scan for new skills (in hours)
+    #[serde(default = "default_scan_interval")]
+    pub scan_interval_hours: u64,
+    /// Minimum score (0.0 - 1.0) required for auto-integration
+    #[serde(default = "default_min_score")]
+    pub min_score: f64,
+    /// Optional GitHub personal-access token for higher rate limits.
+    #[serde(default)]
+    pub github_token: Option<String>,
+    /// Directory where integrated skills are written.
+    #[serde(default = "default_output_dir")]
+    pub output_dir: String,
+}
+
+fn default_auto_integrate() -> bool {
+    true
+}
+fn default_sources() -> Vec<String> {
+    vec!["github".into(), "clawhub".into()]
+}
+fn default_scan_interval() -> u64 {
+    24
+}
+fn default_min_score() -> f64 {
+    0.7
+}
+fn default_output_dir() -> String {
+    "./skills".into()
+}
+
+impl Default for SkillForgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_integrate: default_auto_integrate(),
+            sources: default_sources(),
+            scan_interval_hours: default_scan_interval(),
+            min_score: default_min_score(),
+            github_token: None,
+            output_dir: default_output_dir(),
+        }
     }
 }
 

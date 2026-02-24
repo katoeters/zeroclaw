@@ -1,6 +1,7 @@
 pub mod log;
 pub mod multi;
 pub mod noop;
+pub mod notification;
 pub mod otel;
 pub mod prometheus;
 pub mod traits;
@@ -10,6 +11,7 @@ pub mod verbose;
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
+pub use self::notification::SystemNotifier;
 pub use noop::NoopObserver;
 pub use otel::OtelObserver;
 pub use prometheus::PrometheusObserver;
