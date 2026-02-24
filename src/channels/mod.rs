@@ -2689,18 +2689,25 @@ fn collect_configured_channels(
     let mut channels = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
+        let mut channel = TelegramChannel::new(
+            tg.bot_token.clone(),
+            tg.allowed_users.clone(),
+            tg.mention_only,
+        )
+        .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+        .with_transcription(config.transcription.clone())
+        .with_workspace_dir(config.workspace_dir.clone());
+
+        if let Some(base_url) = tg.base_url.as_deref().and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }) {
+            channel = channel.with_api_base(base_url);
+        }
+
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
-            channel: Arc::new(
-                TelegramChannel::new(
-                    tg.bot_token.clone(),
-                    tg.allowed_users.clone(),
-                    tg.mention_only,
-                )
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_transcription(config.transcription.clone())
-                .with_workspace_dir(config.workspace_dir.clone()),
-            ),
+            channel: Arc::new(channel),
         });
     }
 

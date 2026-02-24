@@ -2855,6 +2855,10 @@ fn default_draft_update_interval_ms() -> u64 {
 pub struct TelegramConfig {
     /// Telegram Bot API token (from @BotFather).
     pub bot_token: String,
+    /// Optional base URL override for Telegram-compatible APIs.
+    /// Defaults to `https://api.telegram.org` when unset.
+    #[serde(default)]
+    pub base_url: Option<String>,
     /// Allowed Telegram user IDs or usernames. Empty = deny all.
     pub allowed_users: Vec<String>,
     /// Streaming mode for progressive response delivery via message edits.
@@ -5256,6 +5260,7 @@ default_temperature = 0.7
                 cli: true,
                 telegram: Some(TelegramConfig {
                     bot_token: "123:ABC".into(),
+                    base_url: None,
                     allowed_users: vec!["user1".into()],
                     stream_mode: StreamMode::default(),
                     draft_update_interval_ms: default_draft_update_interval_ms(),
@@ -5630,6 +5635,7 @@ tool_dispatcher = "xml"
     async fn telegram_config_serde() {
         let tc = TelegramConfig {
             bot_token: "123:XYZ".into(),
+            base_url: Some("https://tapi.bale.ai".into()),
             allowed_users: vec!["alice".into(), "bob".into()],
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
@@ -5639,6 +5645,7 @@ tool_dispatcher = "xml"
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.bot_token, "123:XYZ");
+        assert_eq!(parsed.base_url.as_deref(), Some("https://tapi.bale.ai"));
         assert_eq!(parsed.allowed_users.len(), 2);
         assert_eq!(parsed.stream_mode, StreamMode::Partial);
         assert_eq!(parsed.draft_update_interval_ms, 500);
@@ -5649,6 +5656,7 @@ tool_dispatcher = "xml"
     async fn telegram_config_defaults_stream_off() {
         let json = r#"{"bot_token":"tok","allowed_users":[]}"#;
         let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.base_url.is_none());
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);

@@ -16,3 +16,7 @@ Source anglaise:
 
 - Les noms de clés de configuration restent en anglais.
 - Le comportement runtime exact est défini en anglais.
+
+## Notes de mise à jour
+
+- Ajout de `channels_config.telegram.base_url` pour utiliser une API Telegram-compatible (ex. Bale). Voir la source anglaise pour les détails.

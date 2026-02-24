@@ -144,6 +144,7 @@ Tên trường khác nhau theo channel:
 [channels_config.telegram]
 bot_token = "123456:telegram-token"
 allowed_users = ["*"]
+base_url = "https://api.telegram.org" # tùy chọn: đặt https://tapi.bale.ai để dùng Bale
 stream_mode = "off"               # tùy chọn: off | partial
 draft_update_interval_ms = 1000   # tùy chọn: giới hạn tần suất chỉnh sửa khi streaming một phần
 mention_only = false              # tùy chọn: yêu cầu @mention trong nhóm
@@ -154,6 +155,7 @@ Lưu ý về Telegram:
 
 - `interrupt_on_new_message = true` giữ lại các lượt người dùng bị gián đoạn trong lịch sử hội thoại, sau đó khởi động lại việc tạo nội dung với tin nhắn mới nhất.
 - Phạm vi gián đoạn rất chặt chẽ: cùng người gửi trong cùng chat. Tin nhắn từ các chat khác nhau được xử lý độc lập.
+- `base_url` mặc định `https://api.telegram.org`; đặt `https://tapi.bale.ai` để dùng API tương thích của Bale.
 
 ### 4.2 Discord
 
