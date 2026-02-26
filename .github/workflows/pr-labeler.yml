@@ -2,6 +2,7 @@ name: PR Labeler
 
 on:
     pull_request_target:
+        branches: [dev, main]
         types: [opened, reopened, synchronize, edited, labeled, unlabeled]
     workflow_dispatch:
         inputs:
@@ -23,9 +24,12 @@ permissions:
     pull-requests: write
     issues: write
 
+env:
+    LABEL_POLICY_PATH: .github/label-policy.json
+
 jobs:
     label:
-        runs-on: ubuntu-latest
+        runs-on: [self-hosted, Linux, X64]
         steps:
             - name: Checkout repository
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

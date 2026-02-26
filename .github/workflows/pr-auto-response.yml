@@ -4,9 +4,13 @@ on:
   issues:
     types: [opened, reopened, labeled, unlabeled]
   pull_request_target:
+    branches: [dev, main]
     types: [opened, labeled, unlabeled]
 
 permissions: {}
+
+env:
+  LABEL_POLICY_PATH: .github/label-policy.json
 
 jobs:
   contributor-tier-issues:
@@ -15,7 +19,7 @@ jobs:
       (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'labeled' || github.event.action == 'unlabeled')) ||
       (github.event_name == 'pull_request_target' &&
       (github.event.action == 'labeled' || github.event.action == 'unlabeled'))
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: read
       issues: write
@@ -34,7 +38,7 @@ jobs:
             await script({ github, context, core });
   first-interaction:
     if: github.event.action == 'opened'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       issues: write
       pull-requests: write
@@ -65,7 +69,7 @@ jobs:
 
   labeled-routes:
     if: github.event.action == 'labeled'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: read
       issues: write

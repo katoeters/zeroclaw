@@ -2,7 +2,7 @@
 
 This document maps provider IDs, aliases, and credential environment variables.
 
-Last verified: **February 20, 2026**.
+Last verified: **February 24, 2026**.
 
 ## How to List Providers
 
@@ -43,6 +43,8 @@ credential is not reused for fallback providers.
 | `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | No | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |
 | `bedrock` | `aws-bedrock` | No | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (optional: `AWS_REGION`) |
 | `qianfan` | `baidu` | No | `QIANFAN_API_KEY` |
+| `doubao` | `volcengine`, `ark`, `doubao-cn` | No | `ARK_API_KEY`, `DOUBAO_API_KEY` |
+| `hunyuan` | `tencent` | No | `HUNYUAN_API_KEY` |
 | `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us`, `qwen-code`, `qwen-oauth`, `qwen_oauth` | No | `QWEN_OAUTH_TOKEN`, `DASHSCOPE_API_KEY` |
 | `groq` | — | No | `GROQ_API_KEY` |
 | `mistral` | — | No | `MISTRAL_API_KEY` |
@@ -50,12 +52,24 @@ credential is not reused for fallback providers.
 | `deepseek` | — | No | `DEEPSEEK_API_KEY` |
 | `together` | `together-ai` | No | `TOGETHER_API_KEY` |
 | `fireworks` | `fireworks-ai` | No | `FIREWORKS_API_KEY` |
+| `novita` | — | No | `NOVITA_API_KEY` |
 | `perplexity` | — | No | `PERPLEXITY_API_KEY` |
 | `cohere` | — | No | `COHERE_API_KEY` |
 | `copilot` | `github-copilot` | No | (use config/`API_KEY` fallback with GitHub token) |
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
 | `llamacpp` | `llama.cpp` | Yes | `LLAMACPP_API_KEY` (optional; only if server auth is enabled) |
+| `sglang` | — | Yes | `SGLANG_API_KEY` (optional) |
+| `vllm` | — | Yes | `VLLM_API_KEY` (optional) |
+| `osaurus` | — | Yes | `OSAURUS_API_KEY` (optional; defaults to `"osaurus"`) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
+
+### Vercel AI Gateway Notes
+
+- Provider ID: `vercel` (alias: `vercel-ai`)
+- Base API URL: `https://ai-gateway.vercel.sh/v1`
+- Authentication: `VERCEL_API_KEY`
+- Vercel AI Gateway usage does not require a project deployment.
+- If you see `DEPLOYMENT_NOT_FOUND`, verify the provider is targeting the gateway endpoint above instead of `https://api.vercel.ai`.
 
 ### Gemini Notes
 
@@ -63,6 +77,29 @@ credential is not reused for fallback providers.
 - Auth can come from `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or Gemini CLI OAuth cache (`~/.gemini/oauth_creds.json`)
 - API key requests use `generativelanguage.googleapis.com/v1beta`
 - Gemini CLI OAuth requests use `cloudcode-pa.googleapis.com/v1internal` with Code Assist request envelope semantics
+- Thinking models (e.g. `gemini-3-pro-preview`) are supported — internal reasoning parts are automatically filtered from the response
+
+### Qwen (Alibaba Cloud) Notes
+
+- Provider IDs: `qwen`, `qwen-code` (OAuth), `qwen-oauth`, `dashscope`, `qwen-intl`, `qwen-us`
+- **OAuth Free Tier**: Use `qwen-code` or set `api_key = "qwen-oauth"` in config
+  - Endpoint: `portal.qwen.ai/v1`
+  - Credentials: `~/.qwen/oauth_creds.json` (use `qwen login` to authenticate)
+  - Daily quota: 1000 requests
+  - Available model: `qwen3-coder-plus` (verified 2026-02-24)
+  - Context window: ~32K tokens
+- **API Key Access**: Use `qwen` or `dashscope` provider with `DASHSCOPE_API_KEY`
+  - Endpoint: `dashscope.aliyuncs.com/compatible-mode/v1`
+  - Higher quotas and more models available with paid API key
+- **Authentication**: `QWEN_OAUTH_TOKEN` (for OAuth) or `DASHSCOPE_API_KEY` (for API key)
+- **Recommended Model**: `qwen3-coder-plus` - Optimized for coding tasks
+- **Quota Tracking**: `zeroclaw providers-quota --provider qwen-code` shows static quota info (`?/1000` - unknown remaining, 1000/day total)
+  - Qwen OAuth API does not return rate limit headers
+  - Actual request counting requires local counter (not implemented)
+  - Rate limit errors are detected and parsed for retry backoff
+- **Limitations**:
+  - OAuth free tier limited to 1 model and 1000 requests/day
+  - See test report: `docs/qwen-provider-test-report.md`
 
 ### Ollama Vision Notes
 
@@ -79,12 +116,45 @@ credential is not reused for fallback providers.
 - If `default_model` ends with `:cloud` while `api_url` is local or unset, config validation fails early with an actionable error.
 - Local Ollama model discovery intentionally excludes `:cloud` entries to avoid selecting cloud-only models in local mode.
 
+### Hunyuan Notes
+
+- Provider ID: `hunyuan` (alias: `tencent`)
+- Base API URL: `https://api.hunyuan.cloud.tencent.com/v1`
+- Authentication: `HUNYUAN_API_KEY` (obtain from [Tencent Cloud console](https://console.cloud.tencent.com/hunyuan))
+- Recommended models: `hunyuan-t1-latest` (deep reasoning), `hunyuan-turbo-latest` (fast), `hunyuan-pro` (high quality)
+
 ### llama.cpp Server Notes
 
 - Provider ID: `llamacpp` (alias: `llama.cpp`)
 - Default endpoint: `http://localhost:8080/v1`
 - API key is optional by default; set `LLAMACPP_API_KEY` only when `llama-server` is started with `--api-key`.
 - Model discovery: `zeroclaw models refresh --provider llamacpp`
+
+### SGLang Server Notes
+
+- Provider ID: `sglang`
+- Default endpoint: `http://localhost:30000/v1`
+- API key is optional by default; set `SGLANG_API_KEY` only when the server requires authentication.
+- Tool calling requires launching SGLang with `--tool-call-parser` (e.g. `hermes`, `llama3`, `qwen25`).
+- Model discovery: `zeroclaw models refresh --provider sglang`
+
+### vLLM Server Notes
+
+- Provider ID: `vllm`
+- Default endpoint: `http://localhost:8000/v1`
+- API key is optional by default; set `VLLM_API_KEY` only when the server requires authentication.
+- Model discovery: `zeroclaw models refresh --provider vllm`
+
+### Osaurus Server Notes
+
+- Provider ID: `osaurus`
+- Default endpoint: `http://localhost:1337/v1`
+- API key defaults to `"osaurus"` but is optional; set `OSAURUS_API_KEY` to override or leave unset for keyless access.
+- Model discovery: `zeroclaw models refresh --provider osaurus`
+- [Osaurus](https://github.com/dinoki-ai/osaurus) is a unified AI edge runtime for macOS (Apple Silicon) that combines local MLX inference with cloud provider proxying through a single endpoint.
+- Supports multiple API formats simultaneously: OpenAI-compatible (`/v1/chat/completions`), Anthropic (`/messages`), Ollama (`/chat`), and Open Responses (`/v1/responses`).
+- Built-in MCP (Model Context Protocol) support for tool and context server connectivity.
+- Local models run via MLX (Llama, Qwen, Gemma, GLM, Phi, Nemotron, and others); cloud models are proxied transparently.
 
 ### Bedrock Notes
 
@@ -111,6 +181,42 @@ Behavior:
 - `false`: sends `think: false` to Ollama `/api/chat` requests.
 - `true`: sends `think: true`.
 - Unset: omits `think` and keeps Ollama/model defaults.
+
+### Ollama Vision Override
+
+Some Ollama models support vision (e.g. `llava`, `llama3.2-vision`) while others do not.
+Since ZeroClaw cannot auto-detect this, you can override it in `config.toml`:
+
+```toml
+default_provider = "ollama"
+default_model = "llava"
+model_support_vision = true
+```
+
+Behavior:
+
+- `true`: enables image attachment processing in the agent loop.
+- `false`: disables vision even if the provider reports support.
+- Unset: uses the provider's built-in default.
+
+Environment override: `ZEROCLAW_MODEL_SUPPORT_VISION=true`
+
+### OpenAI Codex Reasoning Level
+
+You can control OpenAI Codex reasoning effort from `config.toml`:
+
+```toml
+[provider]
+reasoning_level = "high"
+```
+
+Behavior:
+
+- Supported values: `minimal`, `low`, `medium`, `high`, `xhigh` (case-insensitive).
+- When set, overrides `ZEROCLAW_CODEX_REASONING_EFFORT`.
+- Unset falls back to `ZEROCLAW_CODEX_REASONING_EFFORT` if present, otherwise defaults to `xhigh`.
+- Legacy compatibility: `runtime.reasoning_level` is accepted but deprecated; prefer `provider.reasoning_level`.
+- If both `provider.reasoning_level` and `runtime.reasoning_level` are set, provider-level value wins.
 
 ### Kimi Code Notes
 
@@ -203,6 +309,7 @@ You can route model calls by hint using `[[model_routes]]`:
 hint = "reasoning"
 provider = "openrouter"
 model = "anthropic/claude-opus-4-20250514"
+max_tokens = 8192
 
 [[model_routes]]
 hint = "fast"

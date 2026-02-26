@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -68,6 +68,8 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -83,6 +85,14 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct ImageSource {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: String,
+    data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,6 +138,16 @@ struct SystemBlock {
 struct NativeChatResponse {
     #[serde(default)]
     content: Vec<NativeContentIn>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,7 +220,7 @@ impl AnthropicProvider {
                     | NativeContentOut::ToolResult { cache_control, .. } => {
                         *cache_control = Some(CacheControl::ephemeral());
                     }
-                    NativeContentOut::ToolUse { .. } => {}
+                    NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
                 }
             }
         }
@@ -281,6 +301,44 @@ impl AnthropicProvider {
         })
     }
 
+    fn parse_inline_image(marker_content: &str) -> Option<NativeContentOut> {
+        let rest = marker_content.strip_prefix("data:")?;
+        let semi_pos = rest.find(';')?;
+        let media_type = rest[..semi_pos].to_string();
+        let after_semi = &rest[semi_pos + 1..];
+        let data = after_semi.strip_prefix("base64,")?;
+        Some(NativeContentOut::Image {
+            source: ImageSource {
+                kind: "base64",
+                media_type,
+                data: data.to_string(),
+            },
+        })
+    }
+
+    fn build_user_content_blocks(content: &str) -> Vec<NativeContentOut> {
+        let (text_part, image_refs) = crate::multimodal::parse_image_markers(content);
+        if image_refs.is_empty() {
+            return vec![NativeContentOut::Text {
+                text: content.to_string(),
+                cache_control: None,
+            }];
+        }
+        let mut blocks = Vec::new();
+        if !text_part.trim().is_empty() {
+            blocks.push(NativeContentOut::Text {
+                text: text_part,
+                cache_control: None,
+            });
+        }
+        for marker_content in image_refs {
+            if let Some(image_block) = Self::parse_inline_image(&marker_content) {
+                blocks.push(image_block);
+            }
+        }
+        blocks
+    }
+
     fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
         let mut system_text = None;
         let mut native_messages = Vec::new();
@@ -324,10 +382,7 @@ impl AnthropicProvider {
                 _ => {
                     native_messages.push(NativeMessage {
                         role: "user".to_string(),
-                        content: vec![NativeContentOut::Text {
-                            text: msg.content.clone(),
-                            cache_control: None,
-                        }],
+                        content: Self::build_user_content_blocks(&msg.content),
                     });
                 }
             }
@@ -361,6 +416,11 @@ impl AnthropicProvider {
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
+
+        let usage = response.usage.map(|u| TokenUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        });
 
         for block in response.content {
             match block.kind.as_str() {
@@ -396,6 +456,8 @@ impl AnthropicProvider {
                 Some(text_parts.join("\n"))
             },
             tool_calls,
+            usage,
+            reasoning_content: None,
         }
     }
 
@@ -495,6 +557,13 @@ impl Provider for AnthropicProvider {
 
     fn supports_native_tools(&self) -> bool {
         true
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
     }
 
     async fn chat_with_tools(
@@ -1314,5 +1383,34 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    #[test]
+    fn native_response_parses_usage() {
+        let json = r#"{
+            "content": [{"type": "text", "text": "Hello"}],
+            "usage": {"input_tokens": 300, "output_tokens": 75}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicProvider::parse_native_response(resp);
+        let usage = result.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(300));
+        assert_eq!(usage.output_tokens, Some(75));
+    }
+
+    #[test]
+    fn native_response_parses_without_usage() {
+        let json = r#"{"content": [{"type": "text", "text": "Hello"}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicProvider::parse_native_response(resp);
+        assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn capabilities_reports_vision_and_native_tool_calling() {
+        let provider = AnthropicProvider::new(Some("test-key"));
+        let caps = provider.capabilities();
+        assert!(caps.vision);
+        assert!(caps.native_tool_calling);
     }
 }

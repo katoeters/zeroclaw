@@ -111,9 +111,9 @@ async fn process_due_jobs(
         )
         .buffer_unordered(max_concurrent);
 
-    while let Some((job_id, success)) = in_flight.next().await {
+    while let Some((job_id, success, output)) = in_flight.next().await {
         if !success {
-            tracing::warn!("Scheduler job '{job_id}' failed");
+            tracing::warn!("Scheduler job '{job_id}' failed: {output}");
         }
     }
 }
@@ -123,7 +123,7 @@ async fn execute_and_persist_job(
     security: &SecurityPolicy,
     job: &CronJob,
     component: &str,
-) -> (String, bool) {
+) -> (String, bool, String) {
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
@@ -132,7 +132,7 @@ async fn execute_and_persist_job(
     let finished_at = Utc::now();
     let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
 
-    (job.id.clone(), success)
+    (job.id.clone(), success, output)
 }
 
 async fn run_agent_job(
@@ -174,6 +174,7 @@ async fn run_agent_job(
                 model_override,
                 config.default_temperature,
                 vec![],
+                false,
             )
             .await
         }
@@ -295,6 +296,15 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
 
+    deliver_announcement(config, channel, target, output).await
+}
+
+pub(crate) async fn deliver_announcement(
+    config: &Config,
+    channel: &str,
+    target: &str,
+    output: &str,
+) -> Result<()> {
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
             let tg = config
@@ -306,7 +316,8 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 tg.bot_token.clone(),
                 tg.allowed_users.clone(),
                 tg.mention_only,
-            );
+            )
+            .with_workspace_dir(config.workspace_dir.clone());
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "discord" => {
@@ -321,7 +332,8 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
-            );
+            )
+            .with_workspace_dir(config.workspace_dir.clone());
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "slack" => {
@@ -357,64 +369,6 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
     }
 
     Ok(())
-}
-
-fn is_env_assignment(word: &str) -> bool {
-    word.contains('=')
-        && word
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-}
-
-fn strip_wrapping_quotes(token: &str) -> &str {
-    token.trim_matches(|c| c == '"' || c == '\'')
-}
-
-fn forbidden_path_argument(security: &SecurityPolicy, command: &str) -> Option<String> {
-    let mut normalized = command.to_string();
-    for sep in ["&&", "||"] {
-        normalized = normalized.replace(sep, "\x00");
-    }
-    for sep in ['\n', ';', '|'] {
-        normalized = normalized.replace(sep, "\x00");
-    }
-
-    for segment in normalized.split('\x00') {
-        let tokens: Vec<&str> = segment.split_whitespace().collect();
-        if tokens.is_empty() {
-            continue;
-        }
-
-        // Skip leading env assignments and executable token.
-        let mut idx = 0;
-        while idx < tokens.len() && is_env_assignment(tokens[idx]) {
-            idx += 1;
-        }
-        if idx >= tokens.len() {
-            continue;
-        }
-        idx += 1;
-
-        for token in &tokens[idx..] {
-            let candidate = strip_wrapping_quotes(token);
-            if candidate.is_empty() || candidate.starts_with('-') || candidate.contains("://") {
-                continue;
-            }
-
-            let looks_like_path = candidate.starts_with('/')
-                || candidate.starts_with("./")
-                || candidate.starts_with("../")
-                || candidate.starts_with("~/")
-                || candidate.contains('/');
-
-            if looks_like_path && !security.is_path_allowed(candidate) {
-                return Some(candidate.to_string());
-            }
-        }
-    }
-
-    None
 }
 
 async fn run_job_command(
@@ -461,7 +415,7 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    if let Some(path) = forbidden_path_argument(security, &job.command) {
+    if let Some(path) = security.forbidden_path_argument(&job.command) {
         return (
             false,
             format!("blocked by security policy: forbidden path argument: {path}"),
@@ -516,7 +470,37 @@ mod tests {
     use crate::cron::{self, DeliveryConfig};
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+
+    async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.original.as_ref() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     async fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
@@ -629,6 +613,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_job_command_blocks_forbidden_option_assignment_path_argument() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["grep".into()];
+        let job = test_job("grep --file=/etc/passwd root ./src");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("/etc/passwd"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_forbidden_short_option_attached_path_argument() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["grep".into()];
+        let job = test_job("grep -f/etc/passwd root ./src");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("/etc/passwd"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_tilde_user_path_argument() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["cat".into()];
+        let job = test_job("cat ~root/.ssh/id_rsa");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("~root/.ssh/id_rsa"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_input_redirection_path_bypass() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["cat".into()];
+        let job = test_job("cat </etc/passwd");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("command not allowed"));
+    }
+
+    #[tokio::test]
     async fn run_job_command_blocks_readonly_mode() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -697,6 +740,10 @@ mod tests {
     async fn run_agent_job_returns_error_without_provider_key() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
+        let _env = env_lock().await;
+        let _generic = EnvGuard::unset("ZEROCLAW_API_KEY");
+        let _fallback = EnvGuard::unset("API_KEY");
+        let _openrouter = EnvGuard::unset("OPENROUTER_API_KEY");
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());
@@ -844,6 +891,143 @@ mod tests {
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
         assert_eq!(updated.last_status.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_success_deletes_one_shot_shell_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_once_at(&config, at, "echo one-shot-shell").unwrap();
+        assert!(job.delete_after_run);
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+        let lookup = cron::get_job(&config, &job.id);
+        assert!(lookup.is_err());
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_failure_disables_one_shot_shell_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_once_at(&config, at, "echo one-shot-shell").unwrap();
+        assert!(job.delete_after_run);
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        assert!(!success);
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.last_status.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_delivery_failure_non_best_effort_marks_error() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &config,
+            Some("announce-job".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "deliver this",
+            SessionTarget::Isolated,
+            None,
+            Some(DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("telegram".into()),
+                to: Some("123456".into()),
+                best_effort: false,
+            }),
+            false,
+        )
+        .unwrap();
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(!success);
+
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert!(updated.enabled);
+        assert_eq!(updated.last_status.as_deref(), Some("error"));
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "error");
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_delivery_failure_best_effort_keeps_success() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &config,
+            Some("announce-job-best-effort".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "deliver this",
+            SessionTarget::Isolated,
+            None,
+            Some(DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("telegram".into()),
+                to: Some("123456".into()),
+                best_effort: true,
+            }),
+            false,
+        )
+        .unwrap();
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert!(updated.enabled);
+        assert_eq!(updated.last_status.as_deref(), Some("ok"));
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_at_schedule_without_delete_after_run_is_not_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_agent_job(
+            &config,
+            Some("at-no-autodelete".into()),
+            crate::cron::Schedule::At { at },
+            "Hello",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!job.delete_after_run);
+
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert!(updated.enabled);
+        assert_eq!(updated.last_status.as_deref(), Some("ok"));
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use crate::multimodal;
 use crate::providers::traits::{
-    ChatMessage, ChatResponse, Provider, ProviderCapabilities, ToolCall,
+    ChatMessage, ChatResponse, Provider, ProviderCapabilities, TokenUsage, ToolCall,
 };
 use async_trait::async_trait;
 use reqwest::Client;
@@ -63,6 +63,10 @@ struct Options {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     message: ResponseMessage,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +166,37 @@ impl OllamaProvider {
 
     fn parse_tool_arguments(arguments: &str) -> serde_json::Value {
         serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    fn normalize_response_text(content: String) -> Option<String> {
+        if content.trim().is_empty() {
+            None
+        } else {
+            Some(content)
+        }
+    }
+
+    fn fallback_text_for_empty_content(model: &str, thinking: Option<&str>) -> String {
+        if let Some(thinking) = thinking.map(str::trim).filter(|value| !value.is_empty()) {
+            let thinking_log_excerpt: String = thinking.chars().take(100).collect();
+            let thinking_reply_excerpt: String = thinking.chars().take(200).collect();
+            tracing::warn!(
+                "Ollama returned empty content with only thinking for model '{}': '{}'. Model may have stopped prematurely.",
+                model,
+                thinking_log_excerpt
+            );
+            return format!(
+                "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
+                thinking_reply_excerpt
+            );
+        }
+
+        tracing::warn!(
+            "Ollama returned empty or whitespace content with no tool calls for model '{}'",
+            model
+        );
+        "I couldn't get a complete response from Ollama. Please try again or switch to a different model."
+            .to_string()
     }
 
     fn build_chat_request(
@@ -504,23 +539,14 @@ impl Provider for OllamaProvider {
 
         // Plain text response
         let content = response.message.content;
-
-        // Handle edge case: model returned only "thinking" with no content or tool calls
-        if content.is_empty() {
-            if let Some(thinking) = &response.message.thinking {
-                tracing::warn!(
-                    "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
-                );
-                return Ok(format!(
-                    "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                    if thinking.len() > 200 { &thinking[..200] } else { thinking }
-                ));
-            }
-            tracing::warn!("Ollama returned empty content with no tool calls");
+        if let Some(content) = Self::normalize_response_text(content) {
+            return Ok(content);
         }
 
-        Ok(content)
+        Ok(Self::fallback_text_for_empty_content(
+            &normalized_model,
+            response.message.thinking.as_deref(),
+        ))
     }
 
     async fn chat_with_history(
@@ -554,25 +580,14 @@ impl Provider for OllamaProvider {
 
         // Plain text response
         let content = response.message.content;
-
-        // Handle edge case: model returned only "thinking" with no content or tool calls
-        // This is a model quirk - it stopped after reasoning without producing output
-        if content.is_empty() {
-            if let Some(thinking) = &response.message.thinking {
-                tracing::warn!(
-                    "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
-                );
-                // Return a message indicating the model's thought process but no action
-                return Ok(format!(
-                    "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                    if thinking.len() > 200 { &thinking[..200] } else { thinking }
-                ));
-            }
-            tracing::warn!("Ollama returned empty content with no tool calls");
+        if let Some(content) = Self::normalize_response_text(content) {
+            return Ok(content);
         }
 
-        Ok(content)
+        Ok(Self::fallback_text_for_empty_content(
+            &normalized_model,
+            response.message.thinking.as_deref(),
+        ))
     }
 
     async fn chat_with_tools(
@@ -600,6 +615,15 @@ impl Provider for OllamaProvider {
             )
             .await?;
 
+        let usage = if response.prompt_eval_count.is_some() || response.eval_count.is_some() {
+            Some(TokenUsage {
+                input_tokens: response.prompt_eval_count,
+                output_tokens: response.eval_count,
+            })
+        } else {
+            None
+        };
+
         // Native tool calls returned by the model.
         if !response.message.tool_calls.is_empty() {
             let tool_calls: Vec<ToolCall> = response
@@ -619,35 +643,30 @@ impl Provider for OllamaProvider {
                     }
                 })
                 .collect();
-            let text = if response.message.content.is_empty() {
-                None
-            } else {
-                Some(response.message.content)
-            };
-            return Ok(ChatResponse { text, tool_calls });
+            let text = Self::normalize_response_text(response.message.content);
+            return Ok(ChatResponse {
+                text,
+                tool_calls,
+                usage,
+                reasoning_content: None,
+            });
         }
 
         // Plain text response.
         let content = response.message.content;
-        if content.is_empty() {
-            if let Some(thinking) = &response.message.thinking {
-                tracing::warn!(
-                    "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
-                );
-                return Ok(ChatResponse {
-                    text: Some(format!(
-                        "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                        if thinking.len() > 200 { &thinking[..200] } else { thinking }
-                    )),
-                    tool_calls: vec![],
-                });
-            }
-            tracing::warn!("Ollama returned empty content with no tool calls");
-        }
+        let text = if let Some(content) = Self::normalize_response_text(content) {
+            content
+        } else {
+            Self::fallback_text_for_empty_content(
+                &normalized_model,
+                response.message.thinking.as_deref(),
+            )
+        };
         Ok(ChatResponse {
-            text: Some(content),
+            text: Some(text),
             tool_calls: vec![],
+            usage,
+            reasoning_content: None,
         })
     }
 
@@ -656,6 +675,46 @@ impl Provider for OllamaProvider {
         // (qwen2.5, llama3.1, mistral-nemo, etc.). chat_with_tools() sends tool
         // definitions in the request and returns structured ToolCall objects.
         true
+    }
+
+    async fn chat(
+        &self,
+        request: crate::providers::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        // Convert ToolSpec to OpenAI-compatible JSON and delegate to chat_with_tools.
+        if let Some(specs) = request.tools {
+            if !specs.is_empty() {
+                let tools: Vec<serde_json::Value> = specs
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": s.name,
+                                "description": s.description,
+                                "parameters": s.parameters
+                            }
+                        })
+                    })
+                    .collect();
+                return self
+                    .chat_with_tools(request.messages, &tools, model, temperature)
+                    .await;
+            }
+        }
+
+        // No tools — fall back to plain text chat.
+        let text = self
+            .chat_with_history(request.messages, model, temperature)
+            .await?;
+        Ok(ChatResponse {
+            text: Some(text),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        })
     }
 }
 
@@ -799,6 +858,24 @@ mod tests {
         let json = r#"{"message":{"role":"assistant","content":""}}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.message.content.is_empty());
+    }
+
+    #[test]
+    fn normalize_response_text_rejects_whitespace_only_content() {
+        assert_eq!(
+            OllamaProvider::normalize_response_text("\n \t".to_string()),
+            None
+        );
+        assert_eq!(
+            OllamaProvider::normalize_response_text(" hello ".to_string()),
+            Some(" hello ".to_string())
+        );
+    }
+
+    #[test]
+    fn fallback_text_for_empty_content_without_thinking_is_generic() {
+        let text = OllamaProvider::fallback_text_for_empty_content("qwen3-coder", None);
+        assert!(text.contains("couldn't get a complete response from Ollama"));
     }
 
     #[test]
@@ -971,5 +1048,25 @@ mod tests {
         let caps = <OllamaProvider as Provider>::capabilities(&provider);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn api_response_parses_eval_counts() {
+        let json = r#"{
+            "message": {"content": "Hello", "tool_calls": []},
+            "prompt_eval_count": 50,
+            "eval_count": 25
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.prompt_eval_count, Some(50));
+        assert_eq!(resp.eval_count, Some(25));
+    }
+
+    #[test]
+    fn api_response_parses_without_eval_counts() {
+        let json = r#"{"message": {"content": "Hello", "tool_calls": []}}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.prompt_eval_count.is_none());
+        assert!(resp.eval_count.is_none());
     }
 }

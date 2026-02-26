@@ -1,4 +1,7 @@
 use super::traits::{Tool, ToolResult};
+use super::url_validation::{
+    normalize_allowed_domains, validate_url, DomainPolicy, UrlSchemePolicy,
+};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -12,6 +15,7 @@ pub struct HttpRequestTool {
     allowed_domains: Vec<String>,
     max_response_size: usize,
     timeout_secs: u64,
+    user_agent: String,
 }
 
 impl HttpRequestTool {
@@ -20,47 +24,30 @@ impl HttpRequestTool {
         allowed_domains: Vec<String>,
         max_response_size: usize,
         timeout_secs: u64,
+        user_agent: String,
     ) -> Self {
         Self {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
             max_response_size,
             timeout_secs,
+            user_agent,
         }
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
-        let url = raw_url.trim();
-
-        if url.is_empty() {
-            anyhow::bail!("URL cannot be empty");
-        }
-
-        if url.chars().any(char::is_whitespace) {
-            anyhow::bail!("URL cannot contain whitespace");
-        }
-
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            anyhow::bail!("Only http:// and https:// URLs are allowed");
-        }
-
-        if self.allowed_domains.is_empty() {
-            anyhow::bail!(
-                "HTTP request tool is enabled but no allowed_domains are configured. Add [http_request].allowed_domains in config.toml"
-            );
-        }
-
-        let host = extract_host(url)?;
-
-        if is_private_or_local_host(&host) {
-            anyhow::bail!("Blocked local/private host: {host}");
-        }
-
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
-            anyhow::bail!("Host '{host}' is not in http_request.allowed_domains");
-        }
-
-        Ok(url.to_string())
+        validate_url(
+            raw_url,
+            &DomainPolicy {
+                allowed_domains: &self.allowed_domains,
+                blocked_domains: &[],
+                allowed_field_name: "http_request.allowed_domains",
+                blocked_field_name: None,
+                empty_allowed_message: "HTTP request tool is enabled but no allowed_domains are configured. Add [http_request].allowed_domains in config.toml",
+                scheme_policy: UrlSchemePolicy::HttpOrHttps,
+                ipv6_error_context: "http_request",
+            },
+        )
     }
 
     fn validate_method(&self, method: &str) -> anyhow::Result<reqwest::Method> {
@@ -114,10 +101,17 @@ impl HttpRequestTool {
         headers: Vec<(String, String)>,
         body: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
+        let timeout_secs = if self.timeout_secs == 0 {
+            tracing::warn!("http_request: timeout_secs is 0, using safe default of 30s");
+            30
+        } else {
+            self.timeout_secs
+        };
         let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
+            .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none());
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(self.user_agent.as_str());
         let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.http_request");
         let client = builder.build()?;
 
@@ -291,6 +285,7 @@ impl Tool for HttpRequestTool {
     }
 }
 
+<<<<<<< HEAD
 // Helper functions similar to browser_open.rs
 
 fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
@@ -441,10 +436,13 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
+=======
+>>>>>>> upstream/main
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::tools::url_validation::{is_private_or_local_host, normalize_domain};
 
     fn test_tool(allowed_domains: Vec<&str>) -> HttpRequestTool {
         let security = Arc::new(SecurityPolicy {
@@ -456,6 +454,7 @@ mod tests {
             allowed_domains.into_iter().map(String::from).collect(),
             1_000_000,
             30,
+            "test".to_string(),
         )
     }
 
@@ -495,10 +494,34 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn validate_accepts_wildcard() {
         let tool = test_tool(vec!["*"]);
         assert!(tool.validate_url("https://google.com").is_ok());
         assert!(tool.validate_url("https://anything.org/path").is_ok());
+=======
+    fn validate_accepts_wildcard_allowlist_for_public_host() {
+        let tool = test_tool(vec!["*"]);
+        assert!(tool.validate_url("https://news.ycombinator.com").is_ok());
+    }
+
+    #[test]
+    fn validate_wildcard_allowlist_still_rejects_private_host() {
+        let tool = test_tool(vec!["*"]);
+        let err = tool
+            .validate_url("https://localhost:8080")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn validate_accepts_wildcard_subdomain_pattern() {
+        let tool = test_tool(vec!["*.example.com"]);
+        assert!(tool.validate_url("https://example.com").is_ok());
+        assert!(tool.validate_url("https://sub.example.com").is_ok());
+        assert!(tool.validate_url("https://other.com").is_err());
+>>>>>>> upstream/main
     }
 
     #[test]
@@ -554,7 +577,7 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30);
+        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30, "test".to_string());
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -670,7 +693,13 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
+        let tool = HttpRequestTool::new(
+            security,
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            "test".to_string(),
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -685,7 +714,13 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
+        let tool = HttpRequestTool::new(
+            security,
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            "test".to_string(),
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -708,6 +743,7 @@ mod tests {
             vec!["example.com".into()],
             10,
             30,
+            "test".to_string(),
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);

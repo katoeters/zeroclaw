@@ -1,9 +1,12 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
+use reqwest::multipart::{Form, Part};
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -14,6 +17,8 @@ pub struct DiscordChannel {
     allowed_users: Vec<String>,
     listen_to_bots: bool,
     mention_only: bool,
+    group_reply_allowed_sender_ids: Vec<String>,
+    workspace_dir: Option<PathBuf>,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
@@ -31,8 +36,22 @@ impl DiscordChannel {
             allowed_users,
             listen_to_bots,
             mention_only,
+            group_reply_allowed_sender_ids: Vec::new(),
+            workspace_dir: None,
             typing_handles: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Configure sender IDs that bypass mention gating in guild channels.
+    pub fn with_group_reply_allowed_senders(mut self, sender_ids: Vec<String>) -> Self {
+        self.group_reply_allowed_sender_ids = normalize_group_reply_allowed_sender_ids(sender_ids);
+        self
+    }
+
+    /// Configure workspace directory used for validating local attachment paths.
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -46,11 +65,315 @@ impl DiscordChannel {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
+    fn is_group_sender_trigger_enabled(&self, sender_id: &str) -> bool {
+        let sender_id = sender_id.trim();
+        if sender_id.is_empty() {
+            return false;
+        }
+        self.group_reply_allowed_sender_ids
+            .iter()
+            .any(|entry| entry == "*" || entry == sender_id)
+    }
+
     fn bot_user_id_from_token(token: &str) -> Option<String> {
         // Discord bot tokens are base64(bot_user_id).timestamp.hmac
         let part = token.split('.').next()?;
         base64_decode(part)
     }
+
+    fn resolve_local_attachment_path(&self, target: &str) -> anyhow::Result<PathBuf> {
+        let workspace = self.workspace_dir.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("workspace_dir is not configured; local file attachments are disabled")
+        })?;
+        let workspace_root = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf());
+
+        let target_path = if let Some(rel) = target.strip_prefix("/workspace/") {
+            workspace.join(rel)
+        } else if target == "/workspace" {
+            workspace.to_path_buf()
+        } else {
+            let path = Path::new(target);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                workspace.join(path)
+            }
+        };
+
+        let resolved = target_path
+            .canonicalize()
+            .with_context(|| format!("attachment path not found: {target}"))?;
+
+        if !resolved.starts_with(&workspace_root) {
+            anyhow::bail!("attachment path escapes workspace: {target}");
+        }
+
+        if !resolved.is_file() {
+            anyhow::bail!("attachment path is not a file: {}", resolved.display());
+        }
+
+        Ok(resolved)
+    }
+}
+
+fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<String> {
+    let mut normalized = sender_ids
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+/// Process Discord message attachments and return a string to append to the
+/// agent message context.
+///
+/// Only `text/*` MIME types are fetched and inlined. All other types are
+/// silently skipped. Fetch errors are logged as warnings.
+async fn process_attachments(
+    attachments: &[serde_json::Value],
+    client: &reqwest::Client,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for att in attachments {
+        let ct = att
+            .get("content_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let name = att
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or("file");
+        let Some(url) = att.get("url").and_then(|v| v.as_str()) else {
+            tracing::warn!(name, "discord: attachment has no url, skipping");
+            continue;
+        };
+        if ct.starts_with("text/") {
+            match client.get(url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(text) = resp.text().await {
+                        parts.push(format!("[{name}]\n{text}"));
+                    }
+                }
+                Ok(resp) => {
+                    tracing::warn!(name, status = %resp.status(), "discord attachment fetch failed");
+                }
+                Err(e) => {
+                    tracing::warn!(name, error = %e, "discord attachment fetch error");
+                }
+            }
+        } else {
+            tracing::debug!(
+                name,
+                content_type = ct,
+                "discord: skipping unsupported attachment type"
+            );
+        }
+    }
+    parts.join("\n---\n")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiscordAttachmentKind {
+    Image,
+    Document,
+    Video,
+    Audio,
+    Voice,
+}
+
+impl DiscordAttachmentKind {
+    fn from_marker(kind: &str) -> Option<Self> {
+        match kind.trim().to_ascii_uppercase().as_str() {
+            "IMAGE" | "PHOTO" => Some(Self::Image),
+            "DOCUMENT" | "FILE" => Some(Self::Document),
+            "VIDEO" => Some(Self::Video),
+            "AUDIO" => Some(Self::Audio),
+            "VOICE" => Some(Self::Voice),
+            _ => None,
+        }
+    }
+
+    fn marker_name(&self) -> &'static str {
+        match self {
+            Self::Image => "IMAGE",
+            Self::Document => "DOCUMENT",
+            Self::Video => "VIDEO",
+            Self::Audio => "AUDIO",
+            Self::Voice => "VOICE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscordAttachment {
+    kind: DiscordAttachmentKind,
+    target: String,
+}
+
+fn parse_attachment_markers(message: &str) -> (String, Vec<DiscordAttachment>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut attachments = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = message[cursor..].find('[') {
+        let start = cursor + rel_start;
+        cleaned.push_str(&message[cursor..start]);
+
+        let Some(rel_end) = message[start..].find(']') else {
+            cleaned.push_str(&message[start..]);
+            cursor = message.len();
+            break;
+        };
+        let end = start + rel_end;
+        let marker_text = &message[start + 1..end];
+
+        let parsed = marker_text.split_once(':').and_then(|(kind, target)| {
+            let kind = DiscordAttachmentKind::from_marker(kind)?;
+            let target = target.trim();
+            if target.is_empty() {
+                return None;
+            }
+            Some(DiscordAttachment {
+                kind,
+                target: target.to_string(),
+            })
+        });
+
+        if let Some(attachment) = parsed {
+            attachments.push(attachment);
+        } else {
+            cleaned.push_str(&message[start..=end]);
+        }
+
+        cursor = end + 1;
+    }
+
+    if cursor < message.len() {
+        cleaned.push_str(&message[cursor..]);
+    }
+
+    (cleaned.trim().to_string(), attachments)
+}
+
+fn classify_outgoing_attachments(
+    attachments: &[DiscordAttachment],
+) -> (Vec<DiscordAttachment>, Vec<String>, Vec<String>) {
+    let mut local_files = Vec::new();
+    let mut remote_urls = Vec::new();
+    let unresolved_markers = Vec::new();
+
+    for attachment in attachments {
+        let target = attachment.target.trim();
+        if target.starts_with("https://") || target.starts_with("http://") {
+            remote_urls.push(target.to_string());
+            continue;
+        }
+
+        local_files.push(attachment.clone());
+    }
+
+    (local_files, remote_urls, unresolved_markers)
+}
+
+fn with_inline_attachment_urls(
+    content: &str,
+    remote_urls: &[String],
+    unresolved_markers: &[String],
+) -> String {
+    let mut lines = Vec::new();
+    if !content.trim().is_empty() {
+        lines.push(content.trim().to_string());
+    }
+    if !remote_urls.is_empty() {
+        lines.extend(remote_urls.iter().cloned());
+    }
+    if !unresolved_markers.is_empty() {
+        lines.extend(unresolved_markers.iter().cloned());
+    }
+    lines.join("\n")
+}
+
+async fn send_discord_message_json(
+    client: &reqwest::Client,
+    bot_token: &str,
+    recipient: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
+    let body = json!({ "content": content });
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .json(&body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        let sanitized = crate::providers::sanitize_api_error(&err);
+        anyhow::bail!("Discord send message failed ({status}): {sanitized}");
+    }
+
+    Ok(())
+}
+
+async fn send_discord_message_with_files(
+    client: &reqwest::Client,
+    bot_token: &str,
+    recipient: &str,
+    content: &str,
+    files: &[PathBuf],
+) -> anyhow::Result<()> {
+    let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
+
+    let mut form = Form::new().text("payload_json", json!({ "content": content }).to_string());
+
+    for (idx, path) in files.iter().enumerate() {
+        let bytes = tokio::fs::read(path).await.map_err(|error| {
+            anyhow::anyhow!(
+                "Discord attachment read failed for '{}': {error}",
+                path.display()
+            )
+        })?;
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment.bin")
+            .to_string();
+        form = form.part(
+            format!("files[{idx}]"),
+            Part::bytes(bytes).file_name(filename),
+        );
+    }
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .multipart(form)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        let sanitized = crate::providers::sanitize_api_error(&err);
+        anyhow::bail!("Discord send message with files failed ({status}): {sanitized}");
+    }
+
+    Ok(())
 }
 
 const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -59,6 +382,7 @@ const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu
 ///
 /// Discord rejects longer payloads with `50035 Invalid Form Body`.
 const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
+const DISCORD_ACK_REACTIONS: &[&str] = &["⚡️", "🦀", "🙌", "💪", "👌", "👀", "👣"];
 
 /// Split a message into chunks that respect Discord's 2000-character limit.
 /// Tries to split at word boundaries when possible.
@@ -108,6 +432,50 @@ fn split_message_for_discord(message: &str) -> Vec<String> {
     chunks
 }
 
+#[allow(clippy::cast_possible_truncation)]
+fn pick_uniform_index(len: usize) -> usize {
+    debug_assert!(len > 0);
+    let upper = len as u64;
+    let reject_threshold = (u64::MAX / upper) * upper;
+
+    loop {
+        let value = rand::random::<u64>();
+        if value < reject_threshold {
+            return (value % upper) as usize;
+        }
+    }
+}
+
+fn random_discord_ack_reaction() -> &'static str {
+    DISCORD_ACK_REACTIONS[pick_uniform_index(DISCORD_ACK_REACTIONS.len())]
+}
+
+/// URL-encode a Unicode emoji for use in Discord reaction API paths.
+///
+/// Discord's reaction endpoints accept raw Unicode emoji in the URL path,
+/// but they must be percent-encoded per RFC 3986. Custom guild emojis use
+/// the `name:id` format and are passed through unencoded.
+fn encode_emoji_for_discord(emoji: &str) -> String {
+    if emoji.contains(':') {
+        return emoji.to_string();
+    }
+
+    use std::fmt::Write as _;
+    let mut encoded = String::new();
+    for byte in emoji.as_bytes() {
+        write!(encoded, "%{byte:02X}").ok();
+    }
+    encoded
+}
+
+fn discord_reaction_url(channel_id: &str, message_id: &str, emoji: &str) -> String {
+    let raw_id = message_id.strip_prefix("discord_").unwrap_or(message_id);
+    let encoded_emoji = encode_emoji_for_discord(emoji);
+    format!(
+        "https://discord.com/api/v10/channels/{channel_id}/messages/{raw_id}/reactions/{encoded_emoji}/@me"
+    )
+}
+
 fn mention_tags(bot_user_id: &str) -> [String; 2] {
     [format!("<@{bot_user_id}>"), format!("<@!{bot_user_id}>")]
 }
@@ -119,19 +487,19 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
 
 fn normalize_incoming_content(
     content: &str,
-    mention_only: bool,
+    require_mention: bool,
     bot_user_id: &str,
 ) -> Option<String> {
     if content.is_empty() {
         return None;
     }
 
-    if mention_only && !contains_bot_mention(content, bot_user_id) {
+    if require_mention && !contains_bot_mention(content, bot_user_id) {
         return None;
     }
 
     let mut normalized = content.to_string();
-    if mention_only {
+    if require_mention {
         for tag in mention_tags(bot_user_id) {
             normalized = normalized.replace(&tag, " ");
         }
@@ -190,34 +558,67 @@ impl Channel for DiscordChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let chunks = split_message_for_discord(&message.content);
+        let raw_content = super::strip_tool_call_tags(&message.content);
+        let (cleaned_content, parsed_attachments) = parse_attachment_markers(&raw_content);
+        let (local_attachment_targets, remote_urls, mut unresolved_markers) =
+            classify_outgoing_attachments(&parsed_attachments);
+        let mut local_files = Vec::new();
+
+        for attachment in &local_attachment_targets {
+            let target = attachment.target.trim();
+            match self.resolve_local_attachment_path(target) {
+                Ok(path) => local_files.push(path),
+                Err(error) => {
+                    tracing::warn!(
+                        target,
+                        error = %error,
+                        "discord: local attachment rejected by workspace policy"
+                    );
+                    unresolved_markers.push(format!(
+                        "[{}:{}]",
+                        attachment.kind.marker_name(),
+                        target
+                    ));
+                }
+            }
+        }
+
+        if !unresolved_markers.is_empty() {
+            tracing::warn!(
+                unresolved = ?unresolved_markers,
+                "discord: unresolved attachment markers were sent as plain text"
+            );
+        }
+
+        // Discord accepts max 10 files per message.
+        if local_files.len() > 10 {
+            tracing::warn!(
+                count = local_files.len(),
+                "discord: truncating local attachment upload list to 10 files"
+            );
+            local_files.truncate(10);
+        }
+
+        let content =
+            with_inline_attachment_urls(&cleaned_content, &remote_urls, &unresolved_markers);
+        let chunks = split_message_for_discord(&content);
+        let client = self.http_client();
 
         for (i, chunk) in chunks.iter().enumerate() {
-            let url = format!(
-                "https://discord.com/api/v10/channels/{}/messages",
-                message.recipient
-            );
-
-            let body = json!({ "content": chunk });
-
-            let resp = self
-                .http_client()
-                .post(&url)
-                .header("Authorization", format!("Bot {}", self.bot_token))
-                .json(&body)
-                .send()
+            if i == 0 && !local_files.is_empty() {
+                send_discord_message_with_files(
+                    &client,
+                    &self.bot_token,
+                    &message.recipient,
+                    chunk,
+                    &local_files,
+                )
                 .await?;
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let err = resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-                anyhow::bail!("Discord send message failed ({status}): {err}");
+            } else {
+                send_discord_message_json(&client, &self.bot_token, &message.recipient, chunk)
+                    .await?;
             }
 
-            // Add a small delay between chunks to avoid rate limiting
             if i < chunks.len() - 1 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -389,14 +790,64 @@ impl Channel for DiscordChannel {
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let is_group_message = d.get("guild_id").is_some();
+                    let allow_sender_without_mention =
+                        is_group_message && self.is_group_sender_trigger_enabled(author_id);
+                    let require_mention =
+                        self.mention_only && is_group_message && !allow_sender_without_mention;
                     let Some(clean_content) =
-                        normalize_incoming_content(content, self.mention_only, &bot_user_id)
+                        normalize_incoming_content(content, require_mention, &bot_user_id)
                     else {
                         continue;
                     };
 
+                    let attachment_text = {
+                        let atts = d
+                            .get("attachments")
+                            .and_then(|a| a.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        process_attachments(&atts, &self.http_client()).await
+                    };
+                    let final_content = if attachment_text.is_empty() {
+                        clean_content
+                    } else {
+                        format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
+                    };
+
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                    let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    let channel_id = d
+                        .get("channel_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    if !message_id.is_empty() && !channel_id.is_empty() {
+                        let reaction_channel = DiscordChannel::new(
+                            self.bot_token.clone(),
+                            self.guild_id.clone(),
+                            self.allowed_users.clone(),
+                            self.listen_to_bots,
+                            self.mention_only,
+                        );
+                        let reaction_channel_id = channel_id.clone();
+                        let reaction_message_id = message_id.to_string();
+                        let reaction_emoji = random_discord_ack_reaction().to_string();
+                        tokio::spawn(async move {
+                            if let Err(err) = reaction_channel
+                                .add_reaction(
+                                    &reaction_channel_id,
+                                    &reaction_message_id,
+                                    &reaction_emoji,
+                                )
+                                .await
+                            {
+                                tracing::debug!(
+                                    "Discord: failed to add ACK reaction for message {reaction_message_id}: {err}"
+                                );
+                            }
+                        });
+                    }
 
                     let channel_msg = ChannelMessage {
                         id: if message_id.is_empty() {
@@ -410,7 +861,7 @@ impl Channel for DiscordChannel {
                         } else {
                             channel_id.clone()
                         },
-                        content: clean_content,
+                        content: final_content,
                         channel: "discord".to_string(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -469,6 +920,63 @@ impl Channel for DiscordChannel {
         if let Some(handle) = guard.remove(recipient) {
             handle.abort();
         }
+        Ok(())
+    }
+
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let url = discord_reaction_url(channel_id, message_id, emoji);
+
+        let resp = self
+            .http_client()
+            .put(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .header("Content-Length", "0")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("Discord add reaction failed ({status}): {sanitized}");
+        }
+
+        Ok(())
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let url = discord_reaction_url(channel_id, message_id, emoji);
+
+        let resp = self
+            .http_client()
+            .delete(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            anyhow::bail!("Discord remove reaction failed ({status}): {sanitized}");
+        }
+
         Ok(())
     }
 }
@@ -603,6 +1111,28 @@ mod tests {
     fn normalize_incoming_content_rejects_empty_after_strip() {
         let cleaned = normalize_incoming_content("<@12345>", true, "12345");
         assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn normalize_group_reply_allowed_sender_ids_trims_and_deduplicates() {
+        let normalized = normalize_group_reply_allowed_sender_ids(vec![
+            " 111 ".into(),
+            "111".into(),
+            String::new(),
+            "  ".into(),
+            "222".into(),
+        ]);
+        assert_eq!(normalized, vec!["111".to_string(), "222".to_string()]);
+    }
+
+    #[test]
+    fn group_reply_sender_override_matches_exact_and_wildcard() {
+        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, true)
+            .with_group_reply_allowed_senders(vec!["111".into(), "*".into()]);
+
+        assert!(ch.is_group_sender_trigger_enabled("111"));
+        assert!(ch.is_group_sender_trigger_enabled("anyone"));
+        assert!(!ch.is_group_sender_trigger_enabled(""));
     }
 
     // Message splitting tests
@@ -803,6 +1333,49 @@ mod tests {
         assert!(guard.contains_key("222"));
     }
 
+    // ── Emoji encoding for reactions ──────────────────────────────
+
+    #[test]
+    fn encode_emoji_unicode_percent_encodes() {
+        let encoded = encode_emoji_for_discord("\u{1F440}");
+        assert_eq!(encoded, "%F0%9F%91%80");
+    }
+
+    #[test]
+    fn encode_emoji_checkmark() {
+        let encoded = encode_emoji_for_discord("\u{2705}");
+        assert_eq!(encoded, "%E2%9C%85");
+    }
+
+    #[test]
+    fn encode_emoji_custom_guild_emoji_passthrough() {
+        let encoded = encode_emoji_for_discord("custom_emoji:123456789");
+        assert_eq!(encoded, "custom_emoji:123456789");
+    }
+
+    #[test]
+    fn encode_emoji_simple_ascii_char() {
+        let encoded = encode_emoji_for_discord("A");
+        assert_eq!(encoded, "%41");
+    }
+
+    #[test]
+    fn random_discord_ack_reaction_is_from_pool() {
+        for _ in 0..128 {
+            let emoji = random_discord_ack_reaction();
+            assert!(DISCORD_ACK_REACTIONS.contains(&emoji));
+        }
+    }
+
+    #[test]
+    fn discord_reaction_url_encodes_emoji_and_strips_prefix() {
+        let url = discord_reaction_url("123", "discord_456", "👀");
+        assert_eq!(
+            url,
+            "https://discord.com/api/v10/channels/123/messages/456/reactions/%F0%9F%91%80/@me"
+        );
+    }
+
     // ── Message ID edge cases ─────────────────────────────────────
 
     #[test]
@@ -914,6 +1487,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_collect)]
     fn split_message_many_short_lines() {
         // Many short lines should be batched into chunks under the limit
         let msg: String = (0..500).map(|i| format!("line {i}\n")).collect();
@@ -961,5 +1535,123 @@ mod tests {
         for part in &parts {
             assert!(part.len() <= DISCORD_MAX_MESSAGE_LENGTH);
         }
+    }
+
+    // process_attachments tests
+
+    #[tokio::test]
+    async fn process_attachments_empty_list_returns_empty() {
+        let client = reqwest::Client::new();
+        let result = process_attachments(&[], &client).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_attachments_skips_unsupported_types() {
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": "https://cdn.discordapp.com/attachments/123/456/doc.pdf",
+            "filename": "doc.pdf",
+            "content_type": "application/pdf"
+        })];
+        let result = process_attachments(&attachments, &client).await;
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_attachment_markers_extracts_supported_markers() {
+        let input = "Report\n[IMAGE:https://example.com/a.png]\n[DOCUMENT:/tmp/a.pdf]";
+        let (cleaned, attachments) = parse_attachment_markers(input);
+
+        assert_eq!(cleaned, "Report");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].kind, DiscordAttachmentKind::Image);
+        assert_eq!(attachments[0].target, "https://example.com/a.png");
+        assert_eq!(attachments[1].kind, DiscordAttachmentKind::Document);
+        assert_eq!(attachments[1].target, "/tmp/a.pdf");
+    }
+
+    #[test]
+    fn parse_attachment_markers_keeps_invalid_marker_text() {
+        let input = "Hello [NOT_A_MARKER:foo] world";
+        let (cleaned, attachments) = parse_attachment_markers(input);
+
+        assert_eq!(cleaned, input);
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_splits_local_remote_and_unresolved() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file_path = temp.path().join("image.png");
+        std::fs::write(&file_path, b"fake").expect("write fixture");
+
+        let attachments = vec![
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Image,
+                target: file_path.to_string_lossy().to_string(),
+            },
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Image,
+                target: "https://example.com/remote.png".to_string(),
+            },
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Video,
+                target: "/tmp/does-not-exist.mp4".to_string(),
+            },
+        ];
+
+        let (locals, remotes, unresolved) = classify_outgoing_attachments(&attachments);
+        assert_eq!(locals.len(), 2);
+        assert_eq!(locals[0].target, file_path.to_string_lossy());
+        assert_eq!(locals[1].target, "/tmp/does-not-exist.mp4");
+        assert_eq!(remotes, vec!["https://example.com/remote.png".to_string()]);
+        assert!(unresolved.is_empty());
+    }
+
+    #[test]
+    fn with_inline_attachment_urls_appends_urls_and_unresolved_markers() {
+        let content = "Done";
+        let remote_urls = vec!["https://example.com/a.png".to_string()];
+        let unresolved = vec!["[IMAGE:/tmp/missing.png]".to_string()];
+
+        let rendered = with_inline_attachment_urls(content, &remote_urls, &unresolved);
+        assert_eq!(
+            rendered,
+            "Done\nhttps://example.com/a.png\n[IMAGE:/tmp/missing.png]"
+        );
+    }
+
+    #[test]
+    fn with_workspace_dir_sets_field() {
+        let channel = DiscordChannel::new("fake".into(), None, vec![], false, false)
+            .with_workspace_dir(PathBuf::from("/tmp/discord-workspace"));
+        assert_eq!(
+            channel.workspace_dir.as_deref(),
+            Some(Path::new("/tmp/discord-workspace"))
+        );
+    }
+
+    #[test]
+    fn resolve_local_attachment_path_blocks_workspace_escape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, b"secret").expect("fixture should be written");
+
+        let channel = DiscordChannel::new("fake".into(), None, vec![], false, false)
+            .with_workspace_dir(workspace.clone());
+
+        let allowed_path = workspace.join("ok.txt");
+        std::fs::write(&allowed_path, b"ok").expect("workspace fixture should be written");
+        let allowed = channel
+            .resolve_local_attachment_path("ok.txt")
+            .expect("workspace file should be allowed");
+        assert!(allowed.starts_with(workspace.canonicalize().unwrap_or(workspace)));
+
+        let escaped = channel.resolve_local_attachment_path(outside.to_string_lossy().as_ref());
+        assert!(escaped.is_err(), "path outside workspace must be rejected");
     }
 }
